@@ -1,148 +1,169 @@
-# ============================================================
-# API DE DÉTECTION DE LA QUALITÉ DES ŒUFS
-# Projet Deep Learning – Groupe 14
-# ============================================================
-
-from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import JSONResponse
+import streamlit as st
 import numpy as np
 import cv2
+import torch
 import joblib
-import tempfile
-import os
+from PIL import Image 
+import io
+from pathlib import Path
 
-# ============================================================
-# INITIALISATION DE L'API
-# ============================================================
+from skimage.feature import graycomatrix, graycoprops
+import torchvision.models as models
+import torchvision.transforms as T
 
-app = FastAPI(
-    title="API Qualité des Œufs",
-    description="Détection automatique des œufs sains et défectueux à partir d'images",
-    version="1.0"
+
+# =========================
+# CONFIGURATION STREAMLIT
+# =========================
+
+st.set_page_config(
+    page_title="Détection de la Qualité des Œufs",
+    layout="centered"
 )
 
-# ============================================================
-# CHARGEMENT DU PIPELINE FINAL
-# ============================================================
+st.title("Détection Automatique de la Qualité des Œufs")
+st.write(
+    "Cette application utilise un modèle d’intelligence artificielle "
+    "pour classifier automatiquement un œuf comme **sain** ou **défectueux** "
+    "à partir d’une image."
+)
 
-PIPELINE_PATH = "pipeline_qualite_oeuf.joblib"
 
-pipeline = joblib.load(PIPELINE_PATH)
+# =========================
+# INITIALISATION
+# =========================
 
-# ============================================================
-# FONCTIONS DE PRÉTRAITEMENT ET EXTRACTION
-# ============================================================
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
-def preprocess_image(image_path, size=(224, 224)):
-    """
-    Prétraitement complet de l'image :
-    - Lecture
-    - Redimensionnement
-    - Conversion en niveaux de gris
-    - Filtre médian
-    - CLAHE
-    """
-    img = cv2.imread(image_path)
-    img = cv2.resize(img, size)
+@st.cache_resource
+def load_pipeline():
+    return joblib.load("pipeline_qualite_oeuf.joblib")
 
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+pipeline = load_pipeline()
 
+
+@st.cache_resource
+def load_cnn():
+    model = models.efficientnet_b0(weights="IMAGENET1K_V1")
+    model.classifier = torch.nn.Identity()
+    model.eval().to(device)
+    return model
+
+cnn_model = load_cnn()
+
+transform = T.Compose([
+    T.Resize((224, 224)),
+    T.ToTensor(),
+    T.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    )
+])
+
+
+# =========================
+# PRÉTRAITEMENTS
+# =========================
+
+def preprocess_gray(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
     gray = cv2.medianBlur(gray, 5)
-
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(2.0, (8, 8))
     gray = clahe.apply(gray)
-
+    gray = cv2.resize(gray, (224, 224))
     return gray
 
 
-def extract_glcm_features(gray):
-    """
-    Extraction simple GLCM (contraste, homogénéité, énergie)
-    """
-    from skimage.feature import graycomatrix, graycoprops
+# =========================
+# EXTRACTION GLCM
+# =========================
 
+def extract_glcm_features(gray):
     glcm = graycomatrix(
         gray,
-        distances=[1],
-        angles=[0],
+        distances=[1, 2],
+        angles=[0, np.pi/4, np.pi/2],
         levels=256,
         symmetric=True,
         normed=True
     )
 
-    features = [
-        graycoprops(glcm, 'contrast')[0, 0],
-        graycoprops(glcm, 'homogeneity')[0, 0],
-        graycoprops(glcm, 'energy')[0, 0],
-        graycoprops(glcm, 'correlation')[0, 0]
-    ]
+    features = []
+    for prop in ["contrast", "homogeneity", "energy", "correlation"]:
+        features.extend(graycoprops(glcm, prop).ravel())
 
     return np.array(features)
 
 
-def extract_classical_features(image_path):
-    """
-    Extraction finale utilisée par le pipeline :
-    CNN (embeddings déjà intégrés en amont)
-    + GLCM (texture)
-    """
-    gray = preprocess_image(image_path)
+# =========================
+# EXTRACTION CNN
+# =========================
+
+def extract_cnn_features(image):
+    image_pil = Image.fromarray(image)
+    tensor = transform(image_pil).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        features = cnn_model(tensor)
+
+    return features.cpu().numpy().squeeze()
+
+
+# =========================
+# EXTRACTION HYBRIDE
+# =========================
+
+def extract_hybrid_cnn_glcm(image_bytes):
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    image = np.array(image)
+
+    gray = preprocess_gray(image)
     glcm_feat = extract_glcm_features(gray)
+    cnn_feat = extract_cnn_features(image)
 
-    return glcm_feat
-
-
-# ============================================================
-# ROUTES DE L'API
-# ============================================================
-
-@app.get("/")
-def root():
-    return {
-        "message": "API Qualité des Œufs opérationnelle",
-        "modele": "Hybrid CNN + GLCM",
-        "status": "OK"
-    }
+    return np.concatenate([cnn_feat, glcm_feat])
 
 
-@app.post("/predict")
-async def predict(file: UploadFile = File(...)):
-    """
-    Prédiction de la qualité d'un œuf à partir d'une image
-    """
-    try:
-        # Sauvegarde temporaire de l'image
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
-            tmp.write(await file.read())
-            tmp_path = tmp.name
+# =========================
+# INTERFACE UTILISATEUR
+# =========================
 
-        # Extraction des caractéristiques
-        X = extract_classical_features(tmp_path)
-        X = X.reshape(1, -1)
+uploaded_file = st.file_uploader(
+    "📤 Téléversez une image d’œuf",
+    type=["jpg", "jpeg", "png"]
+)
 
-        # Prédiction
-        prediction = pipeline.predict(X)[0]
-        proba = pipeline.predict_proba(X)[0]
+if uploaded_file is not None:
 
-        # Nettoyage
-        os.remove(tmp_path)
+    st.image(uploaded_file, caption="Image fournie", use_container_width=True)
 
-        # Interprétation
-        label = "Œuf sain" if prediction == 0 else "Œuf défectueux"
+    if st.button("🔍 Lancer la prédiction"):
 
-        return JSONResponse(
-            content={
-                "prediction": label,
-                "classe_numerique": int(prediction),
-                "probabilites": {
-                    "sain": float(proba[0]),
-                    "defectueux": float(proba[1])
-                }
-            }
+        with st.spinner("Analyse en cours..."):
+
+            image_bytes = uploaded_file.read()
+
+            X = extract_hybrid_cnn_glcm(image_bytes)
+            X = X.reshape(1, -1)
+
+            prediction = pipeline.predict(X)[0]
+            probabilities = pipeline.predict_proba(X)[0]
+
+        st.subheader("📊 Résultat de la classification")
+
+        if prediction == 1:
+            st.error("❌ Œuf défectueux")
+        else:
+            st.success("✅ Œuf sain")
+
+        st.write(
+            f"**Probabilité œuf sain :** {probabilities[0]:.2%}"
+        )
+        st.write(
+            f"**Probabilité œuf défectueux :** {probabilities[1]:.2%}"
         )
 
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"erreur": str(e)}
-        )
+# =========================
+# LANCER LAPPLICATION : streamlit run app.py
+# =========================
